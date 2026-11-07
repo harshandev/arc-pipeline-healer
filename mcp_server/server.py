@@ -11,12 +11,13 @@ Tools:
   - fix_model_sql           : overwrite a model's SQL (Healer uses this)
 """
 
-import os, subprocess, uuid, json
+import os, subprocess, uuid, json, base64
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import snowflake.connector
+import urllib.request
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -39,6 +40,9 @@ def get_conn():
     )
 
 # ── Tool definitions ───────────────────────────────────────────────
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO  = os.environ.get("GITHUB_REPO", "harshandev/arc-pipeline-healer")
+
 TOOLS = [
     {
         "name": "get_pipeline_failures",
@@ -116,6 +120,22 @@ TOOLS = [
                 },
             },
             "required": ["model_name", "fixed_sql", "reason"],
+        },
+    },
+    {
+        "name": "create_github_pr",
+        "description": "Create a GitHub branch with the fixed SQL and open a Pull Request. Call this after fix_model_sql succeeds and run_dbt_model confirms the fix works.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "model_name": {"type": "string", "description": "The dbt model that was fixed"},
+                "failure_type": {"type": "string", "description": "e.g. COLUMN_MISSING"},
+                "broken_line": {"type": "string", "description": "The original broken SQL line"},
+                "fixed_line": {"type": "string", "description": "The corrected SQL line"},
+                "root_cause": {"type": "string", "description": "Plain English explanation of the bug"},
+                "fixed_sql": {"type": "string", "description": "The complete fixed SQL content"},
+            },
+            "required": ["model_name", "failure_type", "broken_line", "fixed_line", "root_cause", "fixed_sql"],
         },
     },
     {
@@ -269,8 +289,103 @@ def tool_log_pipeline_run(params: dict) -> dict:
     return {"logged": True, "model": params["model_name"], "status": params["status"]}
 
 
+def gh_api(method, path, body=None):
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/{path}"
+    data = json.dumps(body).encode() if body else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"token {GITHUB_TOKEN}")
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req) as r:
+        return json.loads(r.read())
+
+
+def tool_create_github_pr(params: dict) -> dict:
+    model       = params["model_name"]
+    failure_type = params["failure_type"]
+    broken_line = params["broken_line"]
+    fixed_line  = params["fixed_line"]
+    root_cause  = params["root_cause"]
+    fixed_sql   = params["fixed_sql"]
+
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    branch = f"fix/dbt-{model}-{ts}"
+
+    # 1. Get main branch SHA
+    main_ref = gh_api("GET", "git/ref/heads/main")
+    base_sha = main_ref["object"]["sha"]
+
+    # 2. Create new branch
+    gh_api("POST", "git/refs", {"ref": f"refs/heads/{branch}", "sha": base_sha})
+
+    # 3. Find the file path in the repo
+    model_path = None
+    for p in DBT_PROJECT.rglob(f"{model}.sql"):
+        # make it relative to the dbt_project dir
+        model_path = "dbt_project/" + str(p.relative_to(DBT_PROJECT))
+        break
+    if not model_path:
+        return {"error": f"Cannot find {model}.sql in repo"}
+
+    # 4. Get current file SHA (needed for update)
+    try:
+        file_info = gh_api("GET", f"contents/{model_path}")
+        file_sha = file_info["sha"]
+    except Exception:
+        file_sha = None
+
+    # 5. Commit the fixed SQL
+    commit_body = {
+        "message": f"fix(dbt): {model} — {failure_type} fix\n\nAuto-healed by ArcAI Pipeline Healer Agent.",
+        "content": base64.b64encode(fixed_sql.encode()).decode(),
+        "branch": branch,
+    }
+    if file_sha:
+        commit_body["sha"] = file_sha
+    gh_api("PUT", f"contents/{model_path}", commit_body)
+
+    # 6. Open the PR
+    pr_body = f"""## Pipeline Auto-Heal
+
+**Model:** `{model}`
+**Failure type:** `{failure_type}`
+**Root cause:** {root_cause}
+
+### Change
+**Before:**
+```sql
+{broken_line}
+```
+**After:**
+```sql
+{fixed_line}
+```
+
+### Verification
+dbt run result: ✅ SUCCESS (verified by Healer Agent before opening this PR)
+
+---
+*Diagnosed and fixed autonomously by ArcAI Pipeline Healer Agent.*
+*Triggered by Snowflake Task → `HEAL_PIPELINE()` → A2A protocol.*
+"""
+    pr = gh_api("POST", "pulls", {
+        "title": f"fix(dbt): {model} — {failure_type} fix",
+        "head": branch,
+        "base": "main",
+        "body": pr_body,
+    })
+    return {
+        "pr_url": pr["html_url"],
+        "pr_number": pr["number"],
+        "branch": branch,
+        "model": model,
+        "status": "opened",
+    }
+
+
 TOOL_MAP = {
-    "get_pipeline_failures": tool_get_pipeline_failures,
+    "get_pipeline_failures":  tool_get_pipeline_failures,
+    "create_github_pr":       tool_create_github_pr,
     "get_model_error_detail": tool_get_model_error_detail,
     "run_dbt_model": tool_run_dbt_model,
     "get_model_sql": tool_get_model_sql,
